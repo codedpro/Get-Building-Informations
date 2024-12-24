@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# Allow .gitignore itself
+!.gitignore
+
+# Allow .py files
+!*.py
+!*.md
