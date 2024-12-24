@@ -1,12 +1,11 @@
 # Ignore everything
 *
 
-# Allow .gitignore
+# Allow .gitignore itself
 !.gitignore
 
 # Allow .py files
 !*.py
 
-# Allow directories (so .py files inside directories are not ignored)
+# Allow directories
 !*/
-a
