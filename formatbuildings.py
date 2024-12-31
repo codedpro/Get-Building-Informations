@@ -1,6 +1,6 @@
 import json
 
-input_filename = 'buildings.json'
+input_filename = 'buildings_gilan.txt'
 output_filename = 'buildings_array.json' 
 
 buildings = []

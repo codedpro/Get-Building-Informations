@@ -7,10 +7,10 @@ import ssl
 from urllib.parse import urlencode
 from tqdm.asyncio import tqdm_asyncio
 
-CHUNK_SIZE = 100_000
-MAX_FAILURES = 3 
-CSV_FILENAME = 'Total-Isfahan-Points.csv'
-JSON_FILENAME = 'buildings.json'
+CHUNK_SIZE = 50_000
+MAX_FAILURES = 10
+CSV_FILENAME = 'Chahar-Mahal-Bakhtiari.csv'
+NDJSON_FILENAME = 'buildings_gilan.txt'
 HEADERS = {
     'Content-Type': 'application/json',
     'Accept': '*/*',
@@ -26,47 +26,45 @@ ssl_context.verify_mode = ssl.CERT_NONE
 
 building_ids = set()
 
-
-def load_existing_buildings(json_filename: str):
+def load_existing_buildings_ndjson(filename: str):
     """
-    Loads previously stored buildings from JSON filename line by line
-    or from a JSON array. Adjust to your format as needed.
+    Load building IDs (and optionally building data) from an ND-JSON file.
+    Each line is one JSON building object.
+    Return a set of building IDs so we avoid duplicates.
     """
-    if not os.path.exists(json_filename):
-        return [], set()
+    if not os.path.exists(filename):
+        return set()
 
-    with open(json_filename, 'r', encoding='utf-8') as f:
-        try:
-            existing_buildings = json.load(f)
-            ids = {bld['id'] for bld in existing_buildings if 'id' in bld}
-            return existing_buildings, ids
-        except json.JSONDecodeError:
-            existing_buildings = []
-            ids = set()
-            f.seek(0)
-            for line in f:
-                try:
-                    building = json.loads(line)
-                    if isinstance(building, dict) and 'id' in building:
-                        existing_buildings.append(building)
-                        ids.add(building['id'])
-                except json.JSONDecodeError:
-                    continue
-            return existing_buildings, ids
+    ids = set()
+    with open(filename, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                building = json.loads(line)
+                b_id = building.get('id')
+                if b_id:
+                    ids.add(b_id)
+            except json.JSONDecodeError:
+                continue
+    return ids
 
-
-def save_buildings_to_json(buildings, json_filename: str):
+def append_buildings_to_ndjson(buildings, filename: str):
     """
-    Saves the buildings to JSON as a single array (list of dicts).
-    Overwrites the file each time. 
+    Append new buildings to an ND-JSON file (one building per line).
     """
-    with open(json_filename, 'w', encoding='utf-8') as f:
-        json.dump(buildings, f, ensure_ascii=False, indent=4)
+    if not buildings:
+        return
 
+    with open(filename, 'a', encoding='utf-8') as f:
+        for bld in buildings:
+            f.write(json.dumps(bld, ensure_ascii=False) + "\n")
 
 def extract_buildings(data):
     """
     Extract the building info out of the JSON response.
+    Returns a list of dicts (each a building).
     """
     buildings = []
     value = data.get('value', [])
@@ -79,11 +77,11 @@ def extract_buildings(data):
             buildings.append(item)
     return buildings
 
-
 async def fetch_building_data(session, index, lat, lon, lock):
     """
-    Fetch building data for a single row (lat, lon).
-    Return (success: bool, reason: str or None, new_buildings: list).
+    Fetch building data for a single (lat, lon).
+    Return a tuple:
+       (idx, success: bool, reason: str, new_buildings: list)
     """
     params = {
         '$top': '20',
@@ -98,8 +96,9 @@ async def fetch_building_data(session, index, lat, lon, lock):
                     try:
                         data = await response.json()
                         buildings = extract_buildings(data)
-                        if buildings is None:
-                            return False, "Extracted buildings is None", []
+                        if not buildings:
+                            # We consider it a successful call but no buildings found
+                            return (index, True, "No buildings found", [])
                         new_buildings = []
                         async with lock:
                             for bld in buildings:
@@ -107,135 +106,250 @@ async def fetch_building_data(session, index, lat, lon, lock):
                                 if b_id and (b_id not in building_ids):
                                     new_buildings.append(bld)
                                     building_ids.add(b_id)
-                        return True, None, new_buildings
+                        return (index, True, None, new_buildings)
                     except json.JSONDecodeError as json_error:
-                        return False, f"JSON decode error: {json_error}", []
+                        return (index, False, f"JSON decode error: {json_error}", [])
                 elif response.status == 404:
-                    return False, "404 Not Found", []
+                    return (index, False, "404 Not Found", [])
                 else:
-                    return False, f"Non-200 response: Status {response.status}", []
+                    return (index, False, f"Non-200 response: Status {response.status}", [])
         except Exception as e:
-            pass 
+            # You can optionally log the exception e here
+            pass
 
-    return False, "All attempts failed after local retries", []
+    # If we exhausted all attempts
+    return (index, False, "All attempts failed after local retries", [])
+from tqdm.asyncio import tqdm
 
-
-async def process_batch(df_chunk, session, lock, fail_counts):
+async def process_batch(df_chunk, session, lock, fail_counts, batch_number, pass_number):
     """
-    Process one batch (DataFrame chunk).
-      - df_chunk: The subset of rows (up to 100k).
-      - session: AIOHTTP session
-      - lock: An asyncio Lock
-      - fail_counts: dictionary to keep track of how many times a row has failed
+    Process one pass of the given df_chunk. Creates and runs tasks for each row in the chunk.
+
     Returns:
-      - failed_rows: list of (index, reason)
-      - new_buildings: list of newly retrieved buildings
+      - next_df_chunk: A filtered df_chunk that excludes rows that succeeded or are permanently failed
+      - total_attempts: how many rows we attempted to process in this pass
+      - successes: how many rows succeeded
+      - zero_build_count: how many returned 0 buildings
+      - new_bld_count: how many new buildings found
+      - failures: how many rows failed in this pass (not cumulative)
     """
-    tasks = []
     points = []
     for idx, row in df_chunk.iterrows():
         try:
-            lat = row['Lat']
-            lon = row['Long']
+            lat = float(row['Lat'])
+            lon = float(row['Long'])
             points.append((idx, lat, lon))
         except KeyError:
-            fail_counts[idx] = MAX_FAILURES 
+            # If lat/long columns are missing, treat as permanent fail
+            fail_counts[idx] = MAX_FAILURES
             continue
 
-    tasks = [
-        fetch_building_data(session, idx, lat, lon, lock)
-        for (idx, lat, lon) in points
-    ]
+    tasks = []
+    for (idx, lat, lon) in points:
+        task = fetch_building_data(session, idx, lat, lon, lock)
+        tasks.append(task)
 
-    failed_rows = []
-    new_buildings = []
+    total_attempts = len(tasks)
+    successes = 0
+    failures = 0
+    zero_build_count = 0
+    new_bld_count = 0
 
-    for coro in tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="Processing Batch"):
-        success, reason, buildings = await coro
-        i = points[0][0] 
-        points.pop(0)
+    # We'll keep track of indices that succeeded (so we remove them from next pass)
+    succeeded_indices = []
+    all_new_buildings = []
+
+    # Use tqdm to track progress
+    desc_str = f"Batch#{batch_number} Pass#{pass_number} - Processing"
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=desc_str):
+        idx, success, reason, buildings = await coro
 
         if success:
-            new_buildings.extend(buildings) 
-            if i in fail_counts:
-                fail_counts.pop(i) 
+            successes += 1
+            if reason == "No buildings found":
+                zero_build_count += 1
+            else:
+                # We have new buildings or reason=None
+                if buildings:
+                    new_bld_count += len(buildings)
+                    all_new_buildings.extend(buildings)  # Collect new buildings for batch write
+            # Mark row as succeeded (no need to re-check)
+            succeeded_indices.append(idx)
+            if idx in fail_counts:
+                fail_counts.pop(idx, None)
         else:
-            fail_counts[i] = fail_counts.get(i, 0) + 1
-            failed_rows.append((i, reason))
+            # Failed
+            failures += 1
+            fail_counts[idx] = fail_counts.get(idx, 0) + 1
 
-    return failed_rows, new_buildings
+    # Add new buildings to the ND-JSON file
+    append_buildings_to_ndjson(all_new_buildings, NDJSON_FILENAME)
+
+    # Handle failed rows properly
+    valid_failed_indices = [idx for idx in fail_counts.keys() if idx in df_chunk.index]
+
+    if valid_failed_indices:
+        failed_rows = df_chunk.loc[valid_failed_indices].copy()
+        failed_rows['Failure Count'] = failed_rows.index.map(fail_counts)
+        failed_rows.to_csv(f"intermediate_failures_batch{batch_number}_pass{pass_number}.csv", index=False)
+        print(f"Intermediate failures logged to intermediate_failures_batch{batch_number}_pass{pass_number}.csv")
+
+    # Remove permanently failed rows from next pass
+    permanently_failed_indices = [
+        idx for idx, fcount in fail_counts.items() if fcount >= MAX_FAILURES
+    ]
+
+    # Remove successes and permanently failed from the next pass
+    rows_to_drop = set(succeeded_indices + permanently_failed_indices)
+    next_df_chunk = df_chunk.drop(rows_to_drop, errors='ignore')
+
+    return next_df_chunk, total_attempts, successes, zero_build_count, new_bld_count, failures
 
 
 async def main():
+    # 1) Load building IDs from ND-JSON to avoid duplicates
+    global building_ids
+    building_ids = load_existing_buildings_ndjson(NDJSON_FILENAME)
 
-    existing_buildings, existing_ids = load_existing_buildings(JSON_FILENAME)
-    building_ids.update(existing_ids)
-    all_buildings = existing_buildings  
+    # We'll track how many total zero-building calls we get for info
+    total_zero_buildings = 0
+
+    # Keep track of how many rows fail after multiple tries (key=index, value=count)
     fail_counts = {}
 
+    # Set up aiohttp session
     connector = aiohttp.TCPConnector(limit=100, ssl=ssl_context)
     async with aiohttp.ClientSession(connector=connector) as session:
         lock = asyncio.Lock()
 
+        # 2) Read the CSV in chunks
         chunk_iter = pd.read_csv(CSV_FILENAME, chunksize=CHUNK_SIZE)
         batch_number = 0
 
         for df_chunk in chunk_iter:
             batch_number += 1
-            print(f"\n--- Processing batch #{batch_number}, size {len(df_chunk)} ---")
+            print(f"\n=== Processing batch #{batch_number}, size {len(df_chunk)} ===")
 
-            for pass_num in range(2):
-                print(f"Batch {batch_number} - Pass {pass_num+1}")
-                failed_rows, new_buildings = await process_batch(df_chunk, session, lock, fail_counts)
-                if new_buildings:
-                    all_buildings.extend(new_buildings)
-
-                df_chunk = df_chunk.loc[
-                    [idx for idx in df_chunk.index if fail_counts.get(idx, 0) < MAX_FAILURES]
-                ]
-
-                if not failed_rows or df_chunk.empty:
+            # We can run multiple passes on the same chunk to retry partial failures.
+            # Let’s do 5 passes by default.
+            for pass_num in range(1, 6):
+                if df_chunk.empty:
+                    print(f"Batch#{batch_number} Pass#{pass_num}: No rows left to process. Stopping passes.")
                     break
 
-            print(f"Saving buildings after batch #{batch_number} ...")
-            save_buildings_to_json(all_buildings, JSON_FILENAME)
+                (
+                    next_df_chunk,
+                    total_attempts,
+                    successes,
+                    zero_build_count,
+                    new_bld_count,
+                    failures
+                ) = await process_batch(
+                    df_chunk, session, lock, fail_counts,
+                    batch_number, pass_num
+                )
 
-        permanently_failed = [idx for (idx, fails) in fail_counts.items() if fails >= MAX_FAILURES]
+                # Logging for this pass
+                print(f"Batch#{batch_number} Pass#{pass_num} Stats:")
+                print(f"   Rows Attempted   = {total_attempts}")
+                print(f"   Successes        = {successes} (including {zero_build_count} with zero buildings)")
+                print(f"   Failures         = {failures}")
+                print(f"   New Buildings    = {new_bld_count}")
+                print(f"   Remaining in df  = {len(next_df_chunk)}")
 
-        print("\n--- Processing complete! ---")
-        print(f"Total buildings in JSON: {len(all_buildings)}")
+                total_zero_buildings += zero_build_count
+
+                # If we found new buildings, append to the NDJSON
+                # (handle that within the same pass if you prefer, but let's do it now)
+                # NOTE: We rely on `process_batch` to have updated the building_ids already
+                # We need to track them inside process_batch or do a separate approach
+                # but each call to fetch_building_data has appended them to building_ids in memory.
+                # So let's store newly found buildings in that function if you prefer.
+                # For demonstration, let's not re-fetch them (would require a big overhead).
+                # We'll rely on the function to do `append_buildings_to_ndjson` for every call.
+                # Alternatively, you can store them in a global or pass a list around.
+                # For now, let's do a separate approach: we won't lose them anyway since
+                # building_ids is updated. If you want to store them to NDJSON in real time,
+                # you can do that in fetch_building_data or process_batch.
+
+                # Replace the chunk with the next filtered chunk
+                df_chunk = next_df_chunk
+
+                # If no failures or the df is empty, stop retrying this batch
+                if failures == 0 or df_chunk.empty:
+                    print(f"Batch#{batch_number} Pass#{pass_num}: No more failures or empty chunk. Moving on.")
+                    break
+
+        # After processing all chunks, figure out which rows never succeeded
+        permanently_failed = [
+            idx for (idx, fails) in fail_counts.items() if fails >= MAX_FAILURES
+        ]
+
+        print("\n=== Processing complete! ===")
+        print(f"Total unique building IDs in memory: {len(building_ids)}")
+        print(f"Total calls that returned 0 buildings: {total_zero_buildings}")
         print(f"Total permanently failed rows: {len(permanently_failed)}")
 
-        if len(permanently_failed) > 0:
+        # Optional: Let the user retry permanently_failed rows from scratch
+        if permanently_failed:
             answer = input("Do you want to retry the permanently failed rows from scratch? (y/n): ")
             if answer.lower().startswith('y'):
+                # Load only Lat/Long for the failed rows
                 df_failed = pd.read_csv(CSV_FILENAME, usecols=['Lat', 'Long'], index_col=None)
+                # We only keep the rows that were marked as permanent fails
+                # We need to align them by index if the CSV had a default range index
+                # If your CSV has no index, permanently_failed might not match directly.
+                # We'll assume the CSV index matches row numbering. If not, adapt accordingly.
                 df_failed = df_failed.loc[permanently_failed]
-                
+
+                # Reset their fail counts
                 for idx in permanently_failed:
                     fail_counts[idx] = 0
 
-                print("Retrying failed rows (one more pass)...")
-                for pass_num in range(2):
-                    failed_rows, new_buildings = await process_batch(df_failed, session, lock, fail_counts)
-                    if new_buildings:
-                        all_buildings.extend(new_buildings)
-                    df_failed = df_failed.loc[
-                        [idx for idx in df_failed.index if fail_counts.get(idx, 0) < MAX_FAILURES]
-                    ]
-                    if not failed_rows or df_failed.empty:
+                print("Retrying failed rows (two more passes)...")
+                for pass_num in range(1, 3):
+                    if df_failed.empty:
+                        print(f"Retry Pass#{pass_num}: No rows left to process.")
                         break
-                
-                save_buildings_to_json(all_buildings, JSON_FILENAME)
-                permanently_failed = [idx for (idx, fails) in fail_counts.items() if fails >= MAX_FAILURES]
+
+                    (
+                        next_df_chunk,
+                        total_attempts,
+                        successes,
+                        zero_build_count,
+                        new_bld_count,
+                        failures
+                    ) = await process_batch(
+                        df_failed, session, lock, fail_counts,
+                        batch_number="Retry", pass_number=pass_num
+                    )
+
+                    print(f"Retry Pass#{pass_num} Stats:")
+                    print(f"   Rows Attempted   = {total_attempts}")
+                    print(f"   Successes        = {successes} (including {zero_build_count} zero-buildings)")
+                    print(f"   Failures         = {failures}")
+                    print(f"   New Buildings    = {new_bld_count}")
+
+                    df_failed = next_df_chunk  # update for next pass
+                    
+                    if failures == 0 or df_failed.empty:
+                        break
+
+                # Re-check
+                permanently_failed = [
+                    idx for (idx, fails) in fail_counts.items() if fails >= MAX_FAILURES
+                ]
                 print(f"After re-try, total permanently failed rows: {len(permanently_failed)}")
+
+            # Save them to a CSV for manual inspection if any remain
             if permanently_failed:
                 df_all = pd.read_csv(CSV_FILENAME, index_col=None)
+                # If the CSV's rows match 1:1 with default index, this works.
+                # Otherwise adapt to your CSV's indexing scheme.
                 df_final_failed = df_all.loc[permanently_failed].copy()
                 df_final_failed['Failure Count'] = df_final_failed.index.map(fail_counts)
                 df_final_failed.to_csv("final_failed_rows.csv", index=False)
                 print("Final failed rows saved to final_failed_rows.csv")
-
 
 if __name__ == '__main__':
     asyncio.run(main())
