@@ -21,7 +21,6 @@ def generate_tile_urls(lat_min, lon_min, lat_max, lon_max, zoom):
     x_min, y_min = lat_lon_to_tile(lat_min, lon_min, zoom)
     x_max, y_max = lat_lon_to_tile(lat_max, lon_max, zoom)
 
-    # Adjust for inverted y-coordinates
     y_min, y_max = min(y_min, y_max), max(y_min, y_max)
 
     print(f"Tile Range: x: {x_min}-{x_max}, y: {y_min}-{y_max}")

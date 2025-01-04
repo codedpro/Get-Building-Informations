@@ -9,8 +9,8 @@ from tqdm.asyncio import tqdm_asyncio
 
 CHUNK_SIZE = 50_000
 MAX_FAILURES = 10
-CSV_FILENAME = 'Chahar-Mahal-Bakhtiari.csv'
-NDJSON_FILENAME = 'buildings_gilan.txt'
+CSV_FILENAME = 'Zanjan.csv'
+NDJSON_FILENAME = 'buildings_Zanjan.txt'
 HEADERS = {
     'Content-Type': 'application/json',
     'Accept': '*/*',
@@ -191,7 +191,7 @@ async def process_batch(df_chunk, session, lock, fail_counts, batch_number, pass
     if valid_failed_indices:
         failed_rows = df_chunk.loc[valid_failed_indices].copy()
         failed_rows['Failure Count'] = failed_rows.index.map(fail_counts)
-        failed_rows.to_csv(f"intermediate_failures_batch{batch_number}_pass{pass_number}.csv", index=False)
+        failed_rows.to_csv(f"intermediate_failures_batch{batch_number}.csv", index=False)
         print(f"Intermediate failures logged to intermediate_failures_batch{batch_number}_pass{pass_number}.csv")
 
     # Remove permanently failed rows from next pass

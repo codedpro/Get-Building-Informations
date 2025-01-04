@@ -1,19 +1,24 @@
 import json
+import gzip
 
-input_filename = 'buildings_gilan.txt'
-output_filename = 'buildings_array.json' 
+input_filename = 'buildings_Zanjan.txt'
+output_filename = 'buildings_array.json.gz'
 
-buildings = []
+with open(input_filename, 'r', encoding='utf-8') as infile, gzip.open(output_filename, 'wt', encoding='utf-8') as outfile:
+    outfile.write("[\n") 
+    first_record = True
 
-with open(input_filename, 'r', encoding='utf-8') as infile:
     for line in infile:
         line = line.strip()
         if line:
             try:
                 building = json.loads(line)
-                buildings.append(building)
+                if not first_record:
+                    outfile.write(",\n")
+                else:
+                    first_record = False
+                json.dump(building, outfile, ensure_ascii=False)
             except json.JSONDecodeError as e:
                 print(f"Skipping invalid JSON line: {e}")
 
-with open(output_filename, 'w', encoding='utf-8') as outfile:
-    json.dump(buildings, outfile, ensure_ascii=False, indent=4)
+    outfile.write("\n]") 
