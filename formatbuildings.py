@@ -1,8 +1,8 @@
 import json
 import gzip
 
-input_filename = 'buildings_Zanjan.txt'
-output_filename = 'buildings_array.json.gz'
+input_filename = 'buildings_West Azerbaijan.txt'
+output_filename = 'building_West Azerbaijan.json.gz'
 
 with open(input_filename, 'r', encoding='utf-8') as infile, gzip.open(output_filename, 'wt', encoding='utf-8') as outfile:
     outfile.write("[\n") 

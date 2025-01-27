@@ -9,8 +9,8 @@ from tqdm.asyncio import tqdm_asyncio
 
 CHUNK_SIZE = 50_000
 MAX_FAILURES = 10
-CSV_FILENAME = 'Zanjan.csv'
-NDJSON_FILENAME = 'buildings_Zanjan.txt'
+CSV_FILENAME = 'West Azerbaijan-point.csv'
+NDJSON_FILENAME = 'buildings_West Azerbaijan.txt'
 HEADERS = {
     'Content-Type': 'application/json',
     'Accept': '*/*',
