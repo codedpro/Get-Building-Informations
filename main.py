@@ -6,11 +6,12 @@ import os
 import ssl
 from urllib.parse import urlencode
 from tqdm.asyncio import tqdm_asyncio
+import argparse
 
 CHUNK_SIZE = 50_000
 MAX_FAILURES = 10
-CSV_FILENAME = 'West Azerbaijan-point.csv'
-NDJSON_FILENAME = 'buildings_West Azerbaijan.txt'
+CSV_FILENAME = 'Alborz_Points_Buildings.csv'
+NDJSON_FILENAME = 'buildings_miss.txt'
 HEADERS = {
     'Content-Type': 'application/json',
     'Accept': '*/*',
@@ -18,6 +19,8 @@ HEADERS = {
     'Referer': 'https://gnaf2.post.ir/',
     'x-api-key': 'YOUR_API_KEY_HERE'
 }
+
+PROGRESS_FILE = 'progress.txt'  # File to store the last processed batch number
 
 ssl_context = ssl.create_default_context()
 ssl_context.set_ciphers('DEFAULT')
@@ -119,6 +122,7 @@ async def fetch_building_data(session, index, lat, lon, lock):
 
     # If we exhausted all attempts
     return (index, False, "All attempts failed after local retries", [])
+
 from tqdm.asyncio import tqdm
 
 async def process_batch(df_chunk, session, lock, fail_counts, batch_number, pass_number):
@@ -191,7 +195,7 @@ async def process_batch(df_chunk, session, lock, fail_counts, batch_number, pass
     if valid_failed_indices:
         failed_rows = df_chunk.loc[valid_failed_indices].copy()
         failed_rows['Failure Count'] = failed_rows.index.map(fail_counts)
-        failed_rows.to_csv(f"intermediate_failures_batch{batch_number}.csv", index=False)
+        failed_rows.to_csv(f"intermediate_failures_batch{batch_number}_pass{pass_number}.csv", index=False)
         print(f"Intermediate failures logged to intermediate_failures_batch{batch_number}_pass{pass_number}.csv")
 
     # Remove permanently failed rows from next pass
@@ -206,7 +210,7 @@ async def process_batch(df_chunk, session, lock, fail_counts, batch_number, pass
     return next_df_chunk, total_attempts, successes, zero_build_count, new_bld_count, failures
 
 
-async def main():
+async def main(start_batch):
     # 1) Load building IDs from ND-JSON to avoid duplicates
     global building_ids
     building_ids = load_existing_buildings_ndjson(NDJSON_FILENAME)
@@ -228,11 +232,16 @@ async def main():
 
         for df_chunk in chunk_iter:
             batch_number += 1
+
+            if batch_number < start_batch:
+                print(f"Skipping batch #{batch_number} as it's before START_BATCH ({start_batch}).")
+                continue
+
             print(f"\n=== Processing batch #{batch_number}, size {len(df_chunk)} ===")
 
             # We can run multiple passes on the same chunk to retry partial failures.
             # Let’s do 5 passes by default.
-            for pass_num in range(1, 6):
+            for pass_num in range(1, 2):
                 if df_chunk.empty:
                     print(f"Batch#{batch_number} Pass#{pass_num}: No rows left to process. Stopping passes.")
                     break
@@ -259,23 +268,11 @@ async def main():
 
                 total_zero_buildings += zero_build_count
 
-                # If we found new buildings, append to the NDJSON
-                # (handle that within the same pass if you prefer, but let's do it now)
-                # NOTE: We rely on `process_batch` to have updated the building_ids already
-                # We need to track them inside process_batch or do a separate approach
-                # but each call to fetch_building_data has appended them to building_ids in memory.
-                # So let's store newly found buildings in that function if you prefer.
-                # For demonstration, let's not re-fetch them (would require a big overhead).
-                # We'll rely on the function to do `append_buildings_to_ndjson` for every call.
-                # Alternatively, you can store them in a global or pass a list around.
-                # For now, let's do a separate approach: we won't lose them anyway since
-                # building_ids is updated. If you want to store them to NDJSON in real time,
-                # you can do that in fetch_building_data or process_batch.
+                with open(PROGRESS_FILE, 'w') as pf:
+                    pf.write(str(batch_number))
 
-                # Replace the chunk with the next filtered chunk
                 df_chunk = next_df_chunk
 
-                # If no failures or the df is empty, stop retrying this batch
                 if failures == 0 or df_chunk.empty:
                     print(f"Batch#{batch_number} Pass#{pass_num}: No more failures or empty chunk. Moving on.")
                     break
@@ -352,4 +349,16 @@ async def main():
                 print("Final failed rows saved to final_failed_rows.csv")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Process building data with batch resume capability.")
+    parser.add_argument('--start-batch', type=int, default=1, help='Batch number to start processing from.')
+    args = parser.parse_args()
+
+    # Check if there's a progress file and set start_batch accordingly if not provided
+    if args.start_batch == 1 and os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, 'r') as pf:
+            last_batch = pf.read().strip()
+            if last_batch.isdigit():
+                args.start_batch = int(last_batch) + 1
+                print(f"Resuming from batch #{args.start_batch} based on progress file.")
+
+    asyncio.run(main(start_batch=args.start_batch))
