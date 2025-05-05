@@ -10,7 +10,7 @@ import argparse
 
 CHUNK_SIZE = 50_000
 MAX_FAILURES = 10
-CSV_FILENAME = 'Alborz_Points_Buildings.csv'
+CSV_FILENAME = 'failures.csv'
 NDJSON_FILENAME = 'buildings_miss.txt'
 HEADERS = {
     'Content-Type': 'application/json',
